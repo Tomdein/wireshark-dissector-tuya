@@ -1,3 +1,56 @@
+local Lockbox = require("lockbox");
+Lockbox.ALLOW_INSECURE = true;
+local Array = require("lockbox.util.array");
+local SHA256Digest = require("lockbox.digest.sha2_256");
+local ECBMode = require("lockbox.cipher.mode.ecb");
+local AES128Cipher = require("lockbox.cipher.aes128");
+local ZeroPadding = require("lockbox.padding.zero");
+local Stream = require("lockbox.util.stream");
+
+function _encrypt(key, data)
+    local cipher = ECBMode.Cipher()
+        .setKey(Array.fromString(key))
+        .setBlockCipher(AES128Cipher)
+        .setPadding(ZeroPadding);
+    local encrypted_bytes = cipher
+        .init()
+        .update(Stream.fromString(data))
+        .finish()
+        .asBytes();
+
+    return Array.toHex(encrypted_bytes)
+end
+
+function _decrypt(key, data)
+    local cipher = ECBMode.Decipher()
+        .setKey(Array.fromString(key))
+        .setBlockCipher(AES128Cipher)
+        .setPadding(ZeroPadding);
+    local decrypted_bytes = cipher
+        .init()
+        .update(Stream.fromString(data))
+        .finish()
+        .asBytes();
+    
+    print("\n\nKey : " .. key .. ", \ndata : '" .. Array.toHex(Array.fromString(data)) .. "', \ndecrypted_data : '" .. Array.toHex(decrypted_bytes) .. "'\n")
+    decrypted_bytes_len = Array.size(decrypted_bytes)
+    decrypted_bytes = Array.truncate(decrypted_bytes, decrypted_bytes_len - decrypted_bytes[decrypted_bytes_len])
+    print("\n\nKey : " .. key .. ", \ndata : '" .. Array.toHex(Array.fromString(data)) .. "', \ndecrypted_data : '" .. Array.toHex(decrypted_bytes) .. "'\n")
+    return Array.toHex(decrypted_bytes)
+end
+
+function decrypt(data)
+    if session_key ~= nil then
+        print("have session key")
+        decrypted_payload = _decrypt(Array.toString(Array.fromHex(session_key)), data)
+    else
+        print("don't have session key")
+        decrypted_payload = _decrypt(tuya_protocol.prefs.device_key, data)
+    end
+
+    return decrypted_payload
+end
+
 tuya_protocol = Proto("Tuya", "Tuya Protocol")
 
 local message_preffix = ProtoField.uint32("tuya.message_preffix", "Preffix", base.HEX)
@@ -7,13 +60,14 @@ local message_sequence_num = ProtoField.uint32("tuya.sequence_number", "Sequence
 local message_command_byte = ProtoField.uint32("tuya.command_byte", "Command Byte", base.HEX)
 local message_payload_size = ProtoField.uint32("tuya.payload_size", "Payload Size", base.UINT)
 
-local data_message = ProtoField.bytes("tuya.data_message", "Data Message", base.SPACE)
-local data_hash = ProtoField.bytes("tuya.data_hash", "Data Hash", base.SPACE)
+local data_message = ProtoField.bytes("tuya.data_message", "Data Message", base.NONE)
+local data_message_decrypted = ProtoField.string("tuya.data_message_decrypted", "Data Message Decrypted",base.ASCII)
+local data_hash = ProtoField.bytes("tuya.data_hash", "Data Hash", base.NONE)
 
 -- DEBUG
 local dissector_state = ProtoField.string("tuya.dissector.state", "Dissector State", base.ASCII)
 
-tuya_protocol.fields = { message_preffix, message_suffix, message_sequence_num, message_command_byte, message_payload_size, data_message, data_hash, dissector_state }
+tuya_protocol.fields = { message_preffix, message_suffix, message_sequence_num, message_command_byte, message_payload_size, data_message, data_message_decrypted, data_hash, dissector_state }
 
 -- -- Preferences
 -- local default_settings = {
@@ -28,15 +82,18 @@ tuya_protocol.fields = { message_preffix, message_suffix, message_sequence_num, 
 -- tuya_protocol.prefs.variant = Pref.enum("Variant", default_settings.variant,
 --     "The variant", variant_pref_enum)
 
-tuya_protocol.prefs.local_key = Pref.string("Device local_key", "", "Local key of the TUYA device you are trying to decode")
+tuya_protocol.prefs.device_key = Pref.string("Device key", "", "Device key of the TUYA device you are trying to decode")
 
 if tuya_states == nil then
     tuya_states = {}
 end
 local f_ip_src = Field.new("ip.src")
 local f_ip_dst = Field.new("ip.dst")
+local HEADER_SIZE = 16
 
 function tuya_protocol.dissector(buffer, pinfo, tree)
+    print("")
+    print("Parsing TUYA packet:")
     local length = buffer:len()
     --if length == 0 then return end
 
@@ -69,7 +126,47 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
         tuya_states[ip_id] = "connected"
     elseif command == 0x4 then
         ip_id = src_ip
-        tuya_states[ip_id] = "shared_key"
+        tuya_states[ip_id] = "session_key"
+    else
+        tuya_states[ip_id] = "other"
+    end
+
+    local payload = nil
+    if(bit.band(buffer(HEADER_SIZE, 4):uint(), 0xFFFFFF00) ~= 0) then
+        payload = buffer(HEADER_SIZE, payload_size:uint() - 0x24):bytes():raw()
+    else
+        payload = buffer(HEADER_SIZE + 4, payload_size:uint() - 4 - 0x24):bytes():raw()
+    end
+
+    if tuya_states[ip_id] == "connected" then
+        remote_key = nil
+        session_key = nil
+        decrypted_payload = decrypt(payload)
+        local_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
+    elseif tuya_states[ip_id] == "session_key" then
+        decrypted_payload = decrypt(payload)
+        remote_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
+        session_key = Array.toString(Array.XOR(Array.fromHex(local_key), Array.fromHex(remote_key)))
+        session_key = _encrypt(tuya_protocol.prefs.device_key, session_key)
+    else
+        decrypted_payload = decrypt(payload)
+    end
+
+    print("payload: " .. payload)
+    print("decrypted data: " .. decrypted_payload)
+    print("device_key: " .. tuya_protocol.prefs.device_key)
+
+    if local_key ~= nil then
+        tuya_subtree:append_text(" : local_key = '" .. local_key .. "'")
+        print("local_key: '" .. local_key .. "'")
+    end
+    if remote_key ~= nil then
+        tuya_subtree:append_text(" : remote_key = '" .. remote_key .. "'")
+        print("remote_key: '" .. remote_key .. "'")
+    end
+    if session_key ~= nil then
+        tuya_subtree:append_text(" : session_key = '" .. session_key .. "'")
+        print("session_key: '" .. session_key .. "'")
     end
 
     tuya_subtree:add(message_sequence_num, seq_num)
@@ -84,6 +181,7 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
     local hash = buffer(length - 32 - 4, 32) -- minus checksum and suffix
 
     payload_subtree:add(data_message, message)
+    payload_subtree:add(data_message_decrypted, decrypted_payload)
     payload_subtree:add(data_hash, hash)
     payload_subtree:add(dissector_state, tuya_states[ip_id]):add_expert_info(PI_DEBUG)
 
