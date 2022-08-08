@@ -84,6 +84,15 @@ local Stream = require("lockbox.util.stream");
 
         -- Ta duh... You are connected :)
 
+    -- DPS (for aubess switch):
+        -- 1:   "code": "switch_1", "value": false
+        -- 9:   "code": "countdown_1", "value": 0
+        -- 38:  "code": "relay_status", "value": "1"
+        -- 42:  "code": "random_time", "value": ""
+        -- 43:  "code": "cycle_time", "value": ""
+        -- 44:  "code": "switch_inching", "value": "AQEs"
+        -- 47?
+
 
     -- ADDITIONAL INFO
     -- for more info on the 3.4 protocol and where I 'inspired' myself go to:
@@ -299,6 +308,7 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
         end
 
         local tuya_packets_subtree = tuya_subtree:add(tuya_protocol, tuya_packet_buffer, "Tuya packet #" .. packet_no):append_text( " : " .. get_command_name(command_byte:uint()))
+        pinfo.cols.info:append(" | packet #" .. packet_no .. " (" .. get_command_name(command_byte:uint()) .. ")")
 
         tuya_packets_subtree:add(pf_message_sequence_num, seq_num)
         tuya_packets_subtree:add(pf_message_command_byte, command_byte):append_text( " (" .. get_command_name(command_byte:uint()) .. ")")
@@ -314,7 +324,10 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
         -- If has payload add payload to subtree
         if payload_empty ~= true then
             payload_subtree:add(pf_data_message, message)
-            payload_subtree:add(pf_data_message_decrypted, decrypted_payload)
+            print(string.sub(decrypted_payload, 1, 3))
+            local decrypted_payload_no_zeros = decrypted_payload
+            if string.sub(decrypted_payload, 1, 3) == "3.4" then decrypted_payload_no_zeros = string.gsub(decrypted_payload, "\0", "") end
+            payload_subtree:add(pf_data_message_decrypted, decrypted_payload_no_zeros)
         end
         payload_subtree:add(pf_data_hash, hash)
         
@@ -332,7 +345,7 @@ tcp_port:add(6668, tuya_protocol)
 
 
 function get_command_name(command)
-    local command_name = "Unknown"
+    local command_name = "UNKNOWN"
 
         if command == 0 then command_name = "UDP"
     elseif command == 1 then command_name = "AP_CONFIG"
