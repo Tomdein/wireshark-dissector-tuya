@@ -43,7 +43,7 @@ local Stream = require("lockbox.util.stream");
             -- Sometimes 4B return_code from remote
             -- xB DATA - has padding
                 -- As to my understanding from the code I am rewriting, the padding is always there. Not shure it is true all the time.
-                -- Padding bytes are the length of padding (0x........10101010101010101010101010101010 - padding is 0x10 == 16 and is 16B long)
+                -- Padding bytes are the length of padding (0x........10101010101010101010101010101010 - padding is 0x10 == 16 and is 16B long, 0x...327D090909090909090909 - 9 x 0x09 (== 9))
             -- 32B HMAC_SHA256 - for as error detectiong code (crc/hash....)
             -- 4B suffix 0x0000AA55
 
@@ -153,6 +153,8 @@ local pf_message_sequence_num = ProtoField.uint32("tuya.sequence_number", "Seque
 local pf_message_command_byte = ProtoField.uint32("tuya.command_byte", "Command Byte", base.HEX)
 local pf_message_payload_size = ProtoField.uint32("tuya.payload_size", "Payload Size", base.UINT)
 
+local pf_message_return_code = ProtoField.uint32("tuya.return_code", "Return Code", base.HEX)
+
 local pf_data_message = ProtoField.bytes("tuya.data_message", "Data Message", base.NONE)
 local pf_data_message_decrypted = ProtoField.string("tuya.data_message_decrypted", "Data Message Decrypted",base.ASCII)
 local pf_data_hash = ProtoField.bytes("tuya.data_hash", "Data Hash", base.NONE)
@@ -169,6 +171,7 @@ tuya_protocol.fields = { pf_device_key,
                         pf_message_sequence_num,
                         pf_message_command_byte,
                         pf_message_payload_size,
+                        pf_message_return_code,
                         pf_data_message,
                         pf_data_message_decrypted,
                         pf_data_hash,
@@ -197,105 +200,130 @@ local f_ip_src = Field.new("ip.src")
 local f_ip_dst = Field.new("ip.dst")
 local HEADER_SIZE = 16
 
+PREFIX = "000055AA"
+SUFFIX = "0000AA55"
+
 function tuya_protocol.dissector(buffer, pinfo, tree)
     print("")
     print("Parsing TUYA packet:")
-    local length = buffer:len()
-    --if length == 0 then return end
 
     pinfo.cols.protocol = tuya_protocol.name
-
+    
     local tuya_subtree = tree:add(tuya_protocol, buffer(), "Tuya Protocol Data")
     
-    -- check if message has prefixes
-    local prefix = buffer(0,4):uint()
-    local suffix = buffer(length - 4, 4):uint()
-    if preffix ~= 0x000055aa and suffix ~= 0x0000aa55 then 
-        tuya_subtree:append_text(" : Invalid prefix or suffix")
-        tuya_subtree:add(pf_message_preffix, prefix)
-        tuya_subtree:add(pf_message_suffix, suffix)
-        return 
-    end
+    local length = buffer:len()
     
     src_ip = f_ip_src().value
     dst_ip = f_ip_dst().value
 
     local packet_no = 1
-    local packet_offset = 0
-    
-    -- add headers info
-    local seq_num = buffer(4,4)
-    local command_byte = buffer(8,4)
-    local payload_size = buffer(12,4)
 
-    local command = command_byte:int()
-    if command == 0x3 then
-        ip_id = dst_ip
-        tuya_states[ip_id] = "connected"
-    elseif command == 0x4 then
-        ip_id = src_ip
-        tuya_states[ip_id] = "session_key"
-    else
-        tuya_states[ip_id] = "other"
-    end
+    -- Find all TUYA packets inside TCP packet and dissect them
+    local buff_in_hexstream = buffer(0, length):bytes():tohex()
+    local packet_bounds, packet_bounds_end = string.find(buff_in_hexstream, PREFIX .. "%x-" .. SUFFIX)
 
-    -- Remove return code
-    -- If there is a return value, remove it (Return value is from the remote)
-    local payload = nil
-    if(bit.band(buffer(HEADER_SIZE, 4):uint(), 0xFFFFFF00) ~= 0) then
-        payload = buffer(HEADER_SIZE, payload_size:uint() - 0x24):bytes():raw()
-    else
-        payload = buffer(HEADER_SIZE + 4, payload_size:uint() - 4 - 0x24):bytes():raw()
-    end
+    while(packet_bounds ~= nil) do
+        packet_start = (packet_bounds - 1) / 2
+        packet_end = (packet_bounds_end) / 2
+        packet_len =  packet_end - packet_start
 
-    if tuya_states[ip_id] == "connected" then
-        remote_key = nil
-        session_key = nil
-        decrypted_payload = decrypt(payload)
-        local_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
-    elseif tuya_states[ip_id] == "session_key" then
-        decrypted_payload = decrypt(payload)
-        remote_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
-        session_key = Array.toString(Array.XOR(Array.fromHex(local_key), Array.fromHex(remote_key)))
-        session_key = _encrypt(tuya_protocol.prefs.device_key, session_key)
-    elseif tuya_states[ip_id] == "else" and command == 0x5 then
-        decrypted_payload = _decrypt(tuya_protocol.prefs.device_key, payload)
-    else
-        decrypted_payload = Array.toString(Array.fromHex(decrypt(payload)))
-    end
+        print("Start: " .. packet_start .. ", End: " .. packet_end .. ", Len: " .. packet_len)
 
-    if packet_no == 1 then
+        tuya_packet_buffer = buffer(packet_start, packet_len)
+        
+        -- add headers info
+        local seq_num = tuya_packet_buffer(4,4)
+        local command_byte = tuya_packet_buffer(8,4)
+        local payload_size = tuya_packet_buffer(12,4)
+
+        local command = command_byte:int()
+        if command == 0x3 then
+            ip_id = dst_ip
+            tuya_states[ip_id] = "connected"
+        elseif command == 0x4 then
+            ip_id = src_ip
+            tuya_states[ip_id] = "session_key"
+        else
+            tuya_states[ip_id] = "other"
+        end
+
+        -- Remove return code
+        -- If there is a return value, remove it (Return value is from the remote)
+        local payload = nil
+        local payload_empty = false
+        local return_code = nil
+        if(bit.band(tuya_packet_buffer(HEADER_SIZE, 4):uint(), 0xFFFFFF00) ~= 0) then
+            if payload_size:uint() == 0x24 then payload_empty = true end
+            payload = tuya_packet_buffer(HEADER_SIZE, payload_size:uint() - 0x24):bytes():raw()
+        else
+            if payload_size:uint() == 0x28 then payload_empty = true end
+            payload = tuya_packet_buffer(HEADER_SIZE + 4, payload_size:uint() - 4 - 0x24):bytes():raw()
+            return_code = tuya_packet_buffer(HEADER_SIZE, 4)
+        end
+
+        if tuya_states[ip_id] == "connected" then
+            remote_key = nil
+            session_key = nil
+            decrypted_payload = decrypt(payload)
+            local_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
+        elseif tuya_states[ip_id] == "session_key" then
+            decrypted_payload = decrypt(payload)
+            remote_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
+            session_key = Array.toString(Array.XOR(Array.fromHex(local_key), Array.fromHex(remote_key)))
+            session_key = _encrypt(tuya_protocol.prefs.device_key, session_key)
+        elseif tuya_states[ip_id] == "else" and command == 0x5 then
+            decrypted_payload = _decrypt(tuya_protocol.prefs.device_key, payload)
+        else
+            if payload_empty == true then
+                decrypted_payload = nil
+            else
+                decrypted_payload = Array.toString(Array.fromHex(decrypt(payload)))
+            end
+        end
+
+        if packet_no == 1 then
             tuya_subtree:add(pf_device_key, tuya_protocol.prefs.device_key)
-        if local_key ~= nil then
-            tuya_subtree:add(pf_local_key, local_key)
+            
+            if local_key ~= nil then
+                tuya_subtree:add(pf_local_key, local_key)
+            end
+            if remote_key ~= nil then
+                tuya_subtree:add(pf_remote_key, remote_key)
+            end
+            if session_key ~= nil then
+                tuya_subtree:add(pf_session_key, session_key)
+            end
+            
+            -- Debug the state machine
+            tuya_subtree:add(pf_dissector_state, tuya_states[ip_id]):add_expert_info(PI_DEBUG)
         end
-        if remote_key ~= nil then
-            tuya_subtree:add(pf_remote_key, remote_key)
+
+        local tuya_packets_subtree = tuya_subtree:add(tuya_protocol, tuya_packet_buffer, "Tuya packet #" .. packet_no):append_text( " : " .. get_command_name(command_byte:uint()))
+
+        tuya_packets_subtree:add(pf_message_sequence_num, seq_num)
+        tuya_packets_subtree:add(pf_message_command_byte, command_byte):append_text( " (" .. get_command_name(command_byte:uint()) .. ")")
+        tuya_packets_subtree:add(pf_message_payload_size, payload_size)
+        if return_code ~=nil then tuya_packets_subtree:add(pf_message_return_code, return_code) end
+        
+        -- add data info
+        local payload_subtree = tuya_packets_subtree:add(tuya_protocol, tuya_packet_buffer(16, packet_len - 16), "Payload") -- minus checksum and suffix
+
+        local message = tuya_packet_buffer(16, packet_len - 16 - 32 - 4) -- minus first 32 and last (32 + 4, checksum and suffix)
+        local hash = tuya_packet_buffer(packet_len - 32 - 4, 32) -- minus checksum and suffix
+
+        -- If has payload add payload to subtree
+        if payload_empty ~= true then
+            payload_subtree:add(pf_data_message, message)
+            payload_subtree:add(pf_data_message_decrypted, decrypted_payload)
         end
-        if session_key ~= nil then
-            tuya_subtree:add(pf_session_key, session_key)
-        end
+        payload_subtree:add(pf_data_hash, hash)
+        
+        -- Try to find next message
+        packet_bounds, packet_bounds_end = string.find(buff_in_hexstream, PREFIX .. "%x-" .. SUFFIX, packet_bounds_end)
+        packet_no = packet_no + 1
     end
-
-    tuya_subtree:add(pf_dissector_state, tuya_states[ip_id]):add_expert_info(PI_DEBUG)
-
-
-    local tuya_packets_subtree = tuya_subtree:add(tuya_protocol, buffer(0, 32), "Tuya packet #" .. packet_no)
-
-    tuya_packets_subtree:add(pf_message_sequence_num, seq_num)
-    tuya_packets_subtree:add(pf_message_command_byte, command_byte):append_text( " (" .. get_command_name(command_byte:uint()) .. ")")
-    tuya_packets_subtree:add(pf_message_payload_size, payload_size)
     
-    -- add data info
-    local payload_subtree = tuya_packets_subtree:add(tuya_protocol, buffer(16, length - 16), "Payload") -- minus checksum and suffix
 
-    local message = buffer(16, length - 16 - 32 - 4) -- minus first 32 and last (32 + 4, checksum and suffix)
-    local hash = buffer(length - 32 - 4, 32) -- minus checksum and suffix
-
-    payload_subtree:add(pf_data_message, message)
-    payload_subtree:add(pf_data_message_decrypted, decrypted_payload)
-    payload_subtree:add(pf_data_hash, hash)
-    -- print(crc32)
 end
 
 local tcp_port = DissectorTable.get("tcp.port")
