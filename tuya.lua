@@ -53,10 +53,10 @@ end
 
 tuya_protocol = Proto("Tuya", "Tuya Protocol")
 
-local pf_device_key = ProtoField.bytes("tuya.device_key", "Device key", base.NONE)
-local pf_local_key = ProtoField.bytes("tuya.local_key", "Local key", base.NONE)
-local pf_remote_key = ProtoField.bytes("tuya.remote_key", "Remote key", base.NONE)
-local pf_session_key = ProtoField.bytes("tuya.session_key", "Session key", base.NONE)
+local pf_device_key = ProtoField.string("tuya.device_key", "Device key", base.ASCII)
+local pf_local_key = ProtoField.string("tuya.local_key", "Local key", base.ASCII)
+local pf_remote_key = ProtoField.string("tuya.remote_key", "Remote key", base.ASCII)
+local pf_session_key = ProtoField.string("tuya.session_key", "Session key", base.ASCII)
 
 local pf_message_preffix = ProtoField.uint32("tuya.message_preffix", "Preffix", base.HEX)
 local pf_message_suffix = ProtoField.uint32("tuya.message_suffix", "Suffix", base.HEX)
@@ -72,7 +72,20 @@ local pf_data_hash = ProtoField.bytes("tuya.data_hash", "Data Hash", base.NONE)
 -- DEBUG
 local pf_dissector_state = ProtoField.string("tuya.dissector.state", "Dissector State", base.ASCII)
 
-tuya_protocol.fields = { pf_message_preffix, pf_message_suffix, pf_message_sequence_num, pf_message_command_byte, pf_message_payload_size, pf_data_message, pf_data_message_decrypted, pf_data_hash, pf_dissector_state }
+tuya_protocol.fields = { pf_device_key,
+                        pf_local_key,
+                        pf_remote_key,
+                        pf_session_key,
+                        pf_message_preffix,
+                        pf_message_suffix,
+                        pf_message_sequence_num,
+                        pf_message_command_byte,
+                        pf_message_payload_size,
+                        pf_data_message,
+                        pf_data_message_decrypted,
+                        pf_data_hash,
+                        pf_dissector_state 
+                    }
 
 -- -- Preferences
 -- local default_settings = {
@@ -118,6 +131,9 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
     
     src_ip = f_ip_src().value
     dst_ip = f_ip_dst().value
+
+    local packet_no = 1
+    local packet_offset = 0
     
     -- add headers info
     local seq_num = buffer(4,4)
@@ -160,26 +176,30 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
     print("decrypted data: " .. decrypted_payload)
     print("device_key: " .. tuya_protocol.prefs.device_key)
 
-    if local_key ~= nil then
-        tuya_subtree:append_text(" : local_key = '" .. local_key .. "'")
-        print("local_key: '" .. local_key .. "'")
-    end
-    if remote_key ~= nil then
-        tuya_subtree:append_text(" : remote_key = '" .. remote_key .. "'")
-        print("remote_key: '" .. remote_key .. "'")
-    end
-    if session_key ~= nil then
-        tuya_subtree:append_text(" : session_key = '" .. session_key .. "'")
-        print("session_key: '" .. session_key .. "'")
+    if packet_no == 1 then
+            tuya_subtree:add(pf_device_key, tuya_protocol.prefs.device_key)
+        if local_key ~= nil then
+            tuya_subtree:add(pf_local_key, local_key)
+        end
+        if remote_key ~= nil then
+            tuya_subtree:add(pf_remote_key, remote_key)
+        end
+        if session_key ~= nil then
+            tuya_subtree:add(pf_session_key, session_key)
+        end
     end
 
-    tuya_subtree:add(pf_message_sequence_num, seq_num)
-    tuya_subtree:add(pf_message_command_byte, command_byte):append_text( " (" .. get_command_name(command_byte:uint()) .. ")")
-    tuya_subtree:add(pf_message_payload_size, payload_size)
+    tuya_subtree:add(pf_dissector_state, tuya_states[ip_id]):add_expert_info(PI_DEBUG)
 
 
+    local tuya_packets_subtree = tuya_subtree:add(tuya_protocol, buffer(0, 32), "Tuya packet #" .. packet_no)
+
+    tuya_packets_subtree:add(pf_message_sequence_num, seq_num)
+    tuya_packets_subtree:add(pf_message_command_byte, command_byte):append_text( " (" .. get_command_name(command_byte:uint()) .. ")")
+    tuya_packets_subtree:add(pf_message_payload_size, payload_size)
+    
     -- add data info
-    local payload_subtree = tuya_subtree:add(tuya_protocol, buffer(16, length - 16), "Data") -- minus checksum and suffix
+    local payload_subtree = tuya_packets_subtree:add(tuya_protocol, buffer(16, length - 16), "Payload") -- minus checksum and suffix
 
     local message = buffer(16, length - 16 - 32 - 4) -- minus first 32 and last (32 + 4, checksum and suffix)
     local hash = buffer(length - 32 - 4, 32) -- minus checksum and suffix
@@ -187,8 +207,6 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
     payload_subtree:add(pf_data_message, message)
     payload_subtree:add(pf_data_message_decrypted, decrypted_payload)
     payload_subtree:add(pf_data_hash, hash)
-    payload_subtree:add(pf_dissector_state, tuya_states[ip_id]):add_expert_info(PI_DEBUG)
-
     -- print(crc32)
 end
 
