@@ -19,11 +19,12 @@ local Stream = require("lockbox.util.stream");
     -- The device key is in ASCII string, while others are in hex stream - e.g. B61978 == 0xB6 0x19 0x78 (because they have random bytes and values 0x00-0x1F fuck up the printing... I am in LUA what can I do, pls help :D)
     -- I do not know where does the naming of the commands came from, so it may not be relevant ¯\_(ツ)_/¯
     -- If the decoding is screwed up, click packets in this order: BIND(0x03), RENAME_GW(0x04)
+    -- If anything else is broken (erors, etc.) -> reload lua plugins: Analyze -> reload lua plugins (ctrl + shift + l (<-'L', not 1))
     -- To find dps (datapoints) descriptions go to https://iot.tuya.com/ -> Cloud -> Api explorer then Device control -> Get Device Specification Attribute (or search Get Device Specification Attribute)
         -- or search Get the device specifications and properties of the device
         -- or try your luck at docs https://developer.tuya.com/en/docs/iot/remote-control?id=Kaof8v52k1ij3 (docs -> cloud development -> standard instruction set -> ..... somewhere in here)
 
-    -- If any of this info seem broken, go to first commit of this info: 'Add code info and description'
+    -- If any of this info seem broken, go to first git commit of this info: 'Add code info and description'
 
     -- TERMINOLOGY
     -- Some terminology (may not match with the terminology of https://github.com/harryzz/tuyapi):
