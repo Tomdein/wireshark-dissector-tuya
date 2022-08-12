@@ -1,6 +1,7 @@
 local Lockbox = require("lockbox");
 Lockbox.ALLOW_INSECURE = true;
 local Array = require("lockbox.util.array");
+local HMAC_SHA256 = require("lockbox.mac.hmac");
 local SHA256Digest = require("lockbox.digest.sha2_256");
 local ECBMode = require("lockbox.cipher.mode.ecb");
 local AES128Cipher = require("lockbox.cipher.aes128");
@@ -18,6 +19,9 @@ local Stream = require("lockbox.util.stream");
     -- The device key is in ASCII string, while others are in hex stream - e.g. B61978 == 0xB6 0x19 0x78 (because they have random bytes and values 0x00-0x1F fuck up the printing... I am in LUA what can I do, pls help :D)
     -- I do not know where does the naming of the commands came from, so it may not be relevant ¯\_(ツ)_/¯
     -- If the decoding is screwed up, click packets in this order: BIND(0x03), RENAME_GW(0x04)
+    -- To find dps (datapoints) descriptions go to https://iot.tuya.com/ -> Cloud -> Api explorer then Device control -> Get Device Specification Attribute (or search Get Device Specification Attribute)
+        -- or search Get the device specifications and properties of the device
+        -- or try your luck at docs https://developer.tuya.com/en/docs/iot/remote-control?id=Kaof8v52k1ij3 (docs -> cloud development -> standard instruction set -> ..... somewhere in here)
 
     -- If any of this info seem broken, go to first commit of this info: 'Add code info and description'
 
@@ -84,6 +88,8 @@ local Stream = require("lockbox.util.stream");
 
         -- Ta duh... You are connected :)
 
+        -- From now on use session key in AES encryption and device_key in HASH
+
     -- DPS (for aubess switch):
         -- 1:   "code": "switch_1", "value": false
         -- 9:   "code": "countdown_1", "value": 0
@@ -126,7 +132,7 @@ function _decrypt(key, data)
         .finish()
         .asBytes();
     
-    print("\n\nKey : " .. key .. ", \ndata : '" .. Array.toHex(Array.fromString(data)) .. "', \ndecrypted_data : '" .. Array.toHex(decrypted_bytes) .. "'\n")
+    print("\n\nKey(hex) : " .. Array.toHex(Array.fromString(key)) .. ", \ndata : '" .. Array.toHex(Array.fromString(data)) .. "', \ndecrypted_data : '" .. Array.toHex(decrypted_bytes) .. "'\n")
     
     -- Remove padding
     decrypted_bytes_len = Array.size(decrypted_bytes)
@@ -148,6 +154,28 @@ function decrypt(data)
     return decrypted_payload
 end
 
+function _hmac_sha256(key, data)
+    local hmac = HMAC_SHA256()
+        .setBlockSize(64)
+        .setDigest(SHA256Digest)
+        .setKey(Array.fromString(key))
+    local hash = hmac
+        .init()
+        .update(Stream.fromString(data))
+        .finish()
+        .asBytes()
+    
+    return Array.toHex(hash)
+end
+
+function hmac_sha256(data)
+    if session_key ~= nil then
+        return _hmac_sha256(Array.toString(Array.fromHex(session_key)), data)
+    else
+        return _hmac_sha256(tuya_protocol.prefs.device_key, data)
+    end
+end
+
 tuya_protocol = Proto("Tuya", "Tuya Protocol")
 
 local pf_device_key = ProtoField.string("tuya.device_key", "Device key", base.ASCII)
@@ -165,8 +193,10 @@ local pf_message_payload_size = ProtoField.uint32("tuya.payload_size", "Payload 
 local pf_message_return_code = ProtoField.uint32("tuya.return_code", "Return Code", base.HEX)
 
 local pf_data_message = ProtoField.bytes("tuya.data_message", "Data Message", base.NONE)
-local pf_data_message_decrypted = ProtoField.string("tuya.data_message_decrypted", "Data Message Decrypted",base.ASCII)
+local pf_data_message_decrypted = ProtoField.string("tuya.data_message_decrypted", "Data Message Decrypted", base.ASCII)
+local pf_data_message_decrypted_seq = ProtoField.uint16("tuya.data_message_decrypted_seq", "Data Message Decrypted Sequence", base.UINT)
 local pf_data_hash = ProtoField.bytes("tuya.data_hash", "Data Hash", base.NONE)
+local pf_data_calculated_hash = ProtoField.string("tuya.data_calculated_hash", "Data Calculated Hash", base.ASCII)
 
 -- DEBUG
 local pf_dissector_state = ProtoField.string("tuya.dissector.state", "Dissector State", base.ASCII)
@@ -183,7 +213,9 @@ tuya_protocol.fields = { pf_device_key,
                         pf_message_return_code,
                         pf_data_message,
                         pf_data_message_decrypted,
+                        pf_data_message_decrypted_seq,
                         pf_data_hash,
+                        pf_data_calculated_hash,
                         pf_dissector_state 
                     }
 
@@ -213,8 +245,7 @@ PREFIX = "000055AA"
 SUFFIX = "0000AA55"
 
 function tuya_protocol.dissector(buffer, pinfo, tree)
-    print("")
-    print("Parsing TUYA packet:")
+    print("\nParsing TUYA packet:")
 
     pinfo.cols.protocol = tuya_protocol.name
     
@@ -252,6 +283,8 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
         elseif command == 0x4 then
             ip_id = src_ip
             tuya_states[ip_id] = "session_key"
+        elseif command == 0x5 then
+            tuya_states[ip_id] = "rename_device"
         else
             tuya_states[ip_id] = "other"
         end
@@ -270,19 +303,44 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
             return_code = tuya_packet_buffer(HEADER_SIZE, 4)
         end
 
+        local calculated_hash = nil
         if tuya_states[ip_id] == "connected" then
             remote_key = nil
             session_key = nil
+        
+            -- Calculate hash and decrypt data
+            calculated_hash = hmac_sha256(tuya_packet_buffer(0, packet_len - 32 - 4):bytes():raw())
             decrypted_payload = decrypt(payload)
+        
             local_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
+        
         elseif tuya_states[ip_id] == "session_key" then
+            -- Calculate hash and decrypt data
+            calculated_hash = hmac_sha256(tuya_packet_buffer(0, packet_len - 32 - 4):bytes():raw())
             decrypted_payload = decrypt(payload)
+        
             remote_key = string.sub(decrypted_payload, 1, 32) -- 1B is 2 chars -> 16B are 32 chars
             session_key = Array.toString(Array.XOR(Array.fromHex(local_key), Array.fromHex(remote_key)))
             session_key = _encrypt(tuya_protocol.prefs.device_key, session_key)
-        elseif tuya_states[ip_id] == "else" and command == 0x5 then
+        
+        elseif tuya_states[ip_id] == "rename_device" then
+            local tmp_session_key = session_key
+            session_key = nil
+        
+            -- Calculate hash and decrypt data
+            calculated_hash = hmac_sha256(tuya_packet_buffer(0, packet_len - 32 - 4):bytes():raw())
+            decrypted_payload = decrypt(payload)
+        
+            session_key = tmp_session_key
+        
+        elseif tuya_states[ip_id] == "other" and command == 0x5 then
+            -- Calculate hash and decrypt data
+            calculated_hash = _hmac_sha256(tuya_protocol.prefs.device_key, tuya_packet_buffer(0, packet_len - 32 - 4):bytes():raw())
             decrypted_payload = _decrypt(tuya_protocol.prefs.device_key, payload)
         else
+            -- Only calculate hash and check if any data is present. If it is -> decrypt the data
+            calculated_hash = hmac_sha256(tuya_packet_buffer(0, packet_len - 32 - 4):bytes():raw())
+
             if payload_empty == true then
                 decrypted_payload = nil
             else
@@ -324,13 +382,34 @@ function tuya_protocol.dissector(buffer, pinfo, tree)
         -- If has payload add payload to subtree
         if payload_empty ~= true then
             payload_subtree:add(pf_data_message, message)
-            print(string.sub(decrypted_payload, 1, 3))
+
             local decrypted_payload_no_zeros = decrypted_payload
-            if string.sub(decrypted_payload, 1, 3) == "3.4" then decrypted_payload_no_zeros = string.gsub(decrypted_payload, "\0", "") end
+            local decrypted_seq = nil
+            if string.sub(decrypted_payload, 1, 3) == "3.4" then
+                decrypted_seq = Struct.unpack(">I2", string.sub(decrypted_payload, 10, 11))
+                decrypted_payload_no_zeros = string.gsub(decrypted_payload, "\0", "") 
+            end
+            
+            -- print(type(decrypted_seq))
+            -- print(Struct.unpack(">I2", decrypted_seq))
             payload_subtree:add(pf_data_message_decrypted, decrypted_payload_no_zeros)
+            
+            if decrypted_seq ~= nil then
+                payload_subtree:add(pf_data_message_decrypted_seq, decrypted_seq)
+                decrypted_seq = nil
+            end
         end
         payload_subtree:add(pf_data_hash, hash)
+        local tree_item = payload_subtree:add(pf_data_calculated_hash, calculated_hash)
         
+        local exp_hash = hash:bytes()
+        local calc_hash = ByteArray.new(calculated_hash)
+        if exp_hash == calc_hash then
+            tree_item:append_text(" [MATCHES] ")
+        else
+            tree_item:append_text(" [DOES NOT MATCH] ")
+        end
+
         -- Try to find next message
         packet_bounds, packet_bounds_end = string.find(buff_in_hexstream, PREFIX .. "%x-" .. SUFFIX, packet_bounds_end)
         packet_no = packet_no + 1
