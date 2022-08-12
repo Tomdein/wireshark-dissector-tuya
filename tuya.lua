@@ -88,7 +88,7 @@ local Stream = require("lockbox.util.stream");
 
         -- Ta duh... You are connected :)
 
-        -- From now on use session key in AES encryption and device_key in HASH
+        -- !!!From now on use session_key in AES encryption and ALSO in HMAC hash!!!
 
     -- DPS (for aubess switch):
         -- 1:   "code": "switch_1", "value": false
